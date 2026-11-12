@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../i18n.dart';
+import '../widgets/reader_gestures.dart';
 import '../models/annotation.dart';
 import '../models/book.dart';
 import '../models/progress.dart';
@@ -115,9 +116,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
   Timer? _sleepTimer;
   int _sleepMinutes = 0; // 0=未设置
 
-  // 音量键操作提示条（开始播放时短暂提示）
-  Timer? _volumeTipTimer;
-  bool _volumeTipVisible = false;
+  // 手势操作提示条（开始播放时短暂提示）
+  Timer? _gestureTipTimer;
+  bool _gestureTipVisible = false;
 
   // 当前阅读位置（章节/段落）
   int _chapter = 0;
@@ -131,7 +132,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
   bool _ttsLoading = false;
   Timer? _ttsLoadingTimer;
 
-  // 系统媒体音量（音量键被 TTS 上下句占用，暂停面板提供滑条调节）
+  // 系统媒体音量（音量键正常调节，暂停面板也提供滑条）
   double _mediaVolume = 1.0;
 
   // 假锁屏（保持 app 前台，蓝牙耳机键可控；长按 2 秒解锁）
@@ -145,10 +146,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
   bool _scrollThrottle = false;
   int? _pendingScrollIndex; // 待跳转 item，渲染出真实高度后校正视口
 
-  // 全屏朗读拖动 seek 状态（字符位置线性定位，与书长无关）
-  bool _dragging = false;
-  int _dragCharPos = 0; // 拖动累计字符位置
-  static const double _charsPerPixel = 2.0; // 每像素对应字数（满屏约 4800 字 ≈ 一章）
   List<int> _itemCharPrefix = [0]; // 每个 item 的 display 字符前缀和（用于 O(log n) 按字定位）
 
   // 章节 display 长度前缀和（用于 O(log n) 定位进度，避免每次全扫全书）
@@ -184,8 +181,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _initLocate();
     _initCharPrefix();
     _itemPositionsListener.itemPositions.addListener(_onScroll);
-    // 音量键逐句控制（原生 MethodChannel）
-    _volumeChannel.setMethodCallHandler(_onVolumeKey);
     // 绑定全局 audio_service 回调（耳机播放键）
     globalAudioHandler?.onPlayRequested = _onHeadsetPlay;
     globalAudioHandler?.onPauseRequested = _onHeadsetPause;
@@ -202,19 +197,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   static const _volumeChannel =
       MethodChannel('com.ddnovelreader/volume_keys');
-
-  /// 原生音量键回调：上=上一句，下=下一句
-  Future<dynamic> _onVolumeKey(MethodCall call) async {
-    if (!_isPlaying || _showControls) return;
-    switch (call.method) {
-      case 'volumeUp':
-        _prevSentence();
-        break;
-      case 'volumeDown':
-        _nextSentence();
-        break;
-    }
-  }
 
   /// 耳机播放键：未进入→开始，播放中→暂停，暂停中→恢复
   void _onHeadsetPlay() {
@@ -274,8 +256,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
     ));
     _tts.dispose();
     _itemPositionsListener.itemPositions.removeListener(_onScroll);
-    _volumeChannel.setMethodCallHandler(null);
-    _volumeChannel.invokeMethod('setVolumeKeysEnabled', false);
     // 解绑耳机回调并停止 MediaSession（handler 实例保留供下次进入复用）
     globalAudioHandler?.onPlayRequested = null;
     globalAudioHandler?.onPauseRequested = null;
@@ -856,19 +836,55 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _approaches = 0;
   }
 
-  void _pageUp() {
-    final current = _itemIndexOf(_chapter, _para);
-    // 向上翻一屏：跳到当前 item 前若干屏
-    final target = (current - 5).clamp(0, _items.length - 1);
-    _jumpToItem(target);
-    _updatePositionFromItem(target);
+  void _pageUp() => _turnPage(-1);
+
+  void _pageDown() => _turnPage(1);
+
+  void _turnPage(int direction) {
+    if (_ttsLoading || _items.isEmpty) return;
+    final visible = _itemPositionsListener.itemPositions.value
+        .where((p) => p.itemTrailingEdge > 0 && p.itemLeadingEdge < 1)
+        .toList()
+      ..sort((a, b) => a.index.compareTo(b.index));
+    final pageSize = visible.length > 1
+        ? max(1, visible.last.index - visible.first.index)
+        : 1;
+    final current = visible.isNotEmpty
+        ? visible.first.index
+        : _itemIndexOf(_chapter, _para, max(0, _ttsSentence));
+    final target = (current + direction * pageSize).clamp(0, _items.length - 1);
+    _navigateToItem(target);
   }
 
-  void _pageDown() {
-    final current = _itemIndexOf(_chapter, _para);
-    final target = (current + 5).clamp(0, _items.length - 1);
-    _jumpToItem(target);
-    _updatePositionFromItem(target);
+  // Skip chapter headings and empty sentences, including at chapter boundaries.
+  void _moveSentence(int direction) {
+    if (_ttsLoading || _items.isEmpty) return;
+    var index = _itemIndexOf(_chapter, _para, max(0, _ttsSentence)) + direction;
+    while (index >= 0 && index < _items.length) {
+      final it = _items[index];
+      if (!it.isTitle) {
+        final sentences = widget.book.chapters[it.chapterIndex]
+            .paragraphs[it.paragraphIndex].sentences;
+        if (it.sentenceIndex < sentences.length &&
+            sentences[it.sentenceIndex].display.trim().isNotEmpty) {
+          _navigateToItem(index);
+          return;
+        }
+      }
+      index += direction;
+    }
+  }
+
+  void _navigateToItem(int index) {
+    // A page may land on a heading; start from its first actual sentence.
+    while (index < _items.length - 1 && _items[index].isTitle) {
+      index++;
+    }
+    _updatePositionFromItem(index);
+    _jumpToItem(index);
+    if (_inReadingMode) {
+      _ttsFollowSeek(_chapter, _para, max(0, _ttsSentence));
+    }
   }
 
   void _updatePositionFromItem(int index) {
@@ -891,7 +907,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     // 拖动 seek 期间由拖动逻辑控制位置。
     // TTS 朗读期间位置由 TTS 句子主导（_onTtsSentenceChanged），
     // 禁止 onScroll 覆盖，否则高亮会错位到视口顶部 item。
-    if (_suppressScrollTrack || _dragging || _isPlaying) return;
+    if (_suppressScrollTrack || _isPlaying) return;
     if (_scrollThrottle) return;
     _scrollThrottle = true;
     Timer(const Duration(milliseconds: 60), () => _scrollThrottle = false);
@@ -1019,7 +1035,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
   /// 进入朗读模式：全屏隐藏UI，开始TTS播放
   Future<void> _play() async {
     if (_inReadingMode) return;
-    _dragging = false;
     final vp = _captureViewport();
     final delta = _chapterBarTop(); // 进入朗读后顶栏偏移归 0
     // 朗读起点 = 视口当前显示的位置（进度 = 滑到哪读到哪）
@@ -1040,7 +1055,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
     });
     _applySystemUi();
     globalAudioHandler?.notifyPlaying();
-    _showVolumeTip();
+    _showGestureTip();
     if (vp != null) _compensateViewport(vp.$1, vp.$2, delta);
     // 从视口当前句子开始朗读（合成首句期间显示 loading）
     _startTtsLoading();
@@ -1048,13 +1063,13 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _stopTtsLoading();
   }
 
-  /// 显示音量键操作提示：立即显现，2.5s 后透明度 500ms 淡出
-  void _showVolumeTip() {
-    _volumeTipTimer?.cancel();
-    setState(() => _volumeTipVisible = true);
-    _volumeTipTimer = Timer(const Duration(milliseconds: 2500), () {
+  /// 显示手势操作提示：立即显现，2.5s 后透明度 500ms 淡出
+  void _showGestureTip() {
+    _gestureTipTimer?.cancel();
+    setState(() => _gestureTipVisible = true);
+    _gestureTipTimer = Timer(const Duration(milliseconds: 2500), () {
       if (!mounted) return;
-      setState(() => _volumeTipVisible = false);
+      setState(() => _gestureTipVisible = false);
     });
   }
 
@@ -1129,9 +1144,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
     _sleepTimer?.cancel();
     _sleepTimer = null;
     _sleepMinutes = 0;
-    _volumeTipTimer?.cancel();
-    _volumeTipTimer = null;
-    _volumeTipVisible = false;
+    _gestureTipTimer?.cancel();
+    _gestureTipTimer = null;
+    _gestureTipVisible = false;
     _ttsLoadingTimer?.cancel();
     _ttsLoadingTimer = null;
     _ttsLoading = false;
@@ -1174,44 +1189,10 @@ class _ReaderScreenState extends State<ReaderScreen> {
 
   void _enterFullscreen() {
     _applySystemUi();
-    _volumeChannel.invokeMethod('setVolumeKeysEnabled', true);
   }
 
   void _exitFullscreen() {
     _applySystemUi();
-    _volumeChannel.invokeMethod('setVolumeKeysEnabled', false);
-  }
-
-  // ---- 全屏朗读：上下滑动快速跳进，语音跟随 ----
-
-  void _onDragSeekStart(DragStartDetails d) {
-    _dragging = true;
-    _dragCharPos = _currentCharPos; // 基准：当前字符位置
-  }
-
-  void _onDragSeekUpdate(DragUpdateDetails d) {
-    // 字符线性定位：每像素 _charsPerPixel 字，与整书长度无关，体感一致
-    // 方向：上滑 dy<0 → 字符位置减小=快退，下滑 dy>0 → 增大=快进
-    final total = _itemCharPrefix.isEmpty ? 0 : _itemCharPrefix.last;
-    _dragCharPos =
-        (_dragCharPos + (d.delta.dy * _charsPerPixel).round()).clamp(0, total);
-    final (c, p, s, itemIdx) = _locateByChar(_dragCharPos);
-    if (_chapter != c || _para != p || _ttsSentence != s) {
-      setState(() {
-        _chapter = c;
-        _para = p;
-        _ttsSentence = s; // 句子级高亮跟随
-      });
-      if (_itemScrollController.isAttached) {
-        _itemScrollController.jumpTo(index: itemIdx, alignment: 0);
-      }
-    }
-  }
-
-  void _onDragSeekEnd() {
-    _dragging = false;
-    _ttsFollowSeek(_chapter, _para, _ttsSentence); // 语音跟随到句子
-    _scheduleSave();
   }
 
   /// 让语音跟随到 (c, p, 段内句子s)
@@ -1306,7 +1287,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
         _ttsSentence = s;
       });
       // 高亮跟随：每次句子变化都滚动到该句子 item，保持在视口 25% 位置
-      if (!_dragging && _itemScrollController.isAttached) {
+      if (_itemScrollController.isAttached) {
         final idx = _itemIndexOf(c, p, s);
         _itemScrollController.jumpTo(index: idx, alignment: 0.25);
       }
@@ -1341,17 +1322,9 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   // 上一句 / 下一句
-  void _prevSentence() {
-    if (_ttsLoading) return; // 加载中忽略，防误触
-    if (!_isPlaying) return;
-    _tts.prev();
-  }
+  void _prevSentence() => _moveSentence(-1);
 
-  void _nextSentence() {
-    if (_ttsLoading) return; // 加载中忽略，防误触
-    if (!_isPlaying) return;
-    _tts.next();
-  }
+  void _nextSentence() => _moveSentence(1);
 
   // ---------- 进度条 ----------
 
@@ -1583,7 +1556,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
           // 三区点击层
           _buildTapZones(),
           // 拖动 seek 预览浮层
-          if (_dragging) _buildDragPreview(),
           // 朗读模式底部控制面板（暂停时显示）
           if (_inReadingMode && _showReadingPanel) _buildReadingPanel(),
           // 顶部控制栏
@@ -1594,8 +1566,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
           if (_showControls) _buildFloatingChapter(),
           // 查找结果浮动条
           if (_showControls && _searchHits.isNotEmpty) _buildSearchBar(),
-          // 音量键操作提示条（开始播放时短暂提示，2.5s 后淡出）
-          if (_inReadingMode) _buildVolumeTip(),
+          // 手势操作提示条（开始播放时短暂提示，2.5s 后淡出）
+          if (_inReadingMode) _buildGestureTip(),
           // TTS 加载中浮层（朗读模式点击恢复播放时显示）
           if (_inReadingMode && _ttsLoading) _buildTtsLoadingOverlay(),
             // 亮度遮罩
@@ -1639,8 +1611,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
     );
   }
 
-  /// 音量键操作提示条：屏幕中下部半透明圆角胶囊，2.5s 后透明度淡出
-  Widget _buildVolumeTip() {
+  /// 手势操作提示条：屏幕中下部半透明圆角胶囊，2.5s 后透明度淡出
+  Widget _buildGestureTip() {
     return Positioned(
       left: 0,
       right: 0,
@@ -1648,7 +1620,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
       child: IgnorePointer(
         child: Center(
           child: AnimatedOpacity(
-            opacity: _volumeTipVisible ? 1.0 : 0.0,
+            opacity: _gestureTipVisible ? 1.0 : 0.0,
             duration: const Duration(milliseconds: 500),
             curve: Curves.easeOut,
             child: Container(
@@ -1660,7 +1632,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
               child: Row(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.volume_up, color: Colors.white70, size: 18),
+                  const Icon(Icons.swipe, color: Colors.white70, size: 18),
                   const SizedBox(width: 8),
                   Text(
                     T('volHint'),
@@ -1763,10 +1735,8 @@ class _ReaderScreenState extends State<ReaderScreen> {
     return ScrollablePositionedList.builder(
       itemScrollController: _itemScrollController,
       itemPositionsListener: _itemPositionsListener,
-      // 全屏模式（隐藏UI）可滑动；UI模式禁滚，统一用点击三区翻页
-      physics: _showControls
-          ? const NeverScrollableScrollPhysics()
-          : null,
+      // Screen gestures handle sentence and page navigation in every mode.
+      physics: const NeverScrollableScrollPhysics(),
       // 增大缓存区：跳转后能渲染更多 item，加速精确定位
       minCacheExtent: 1500,
       // 顶部留白由 Column 的标题栏承担；底部留 120 给进度条/朗读面板
@@ -1818,48 +1788,6 @@ class _ReaderScreenState extends State<ReaderScreen> {
     );
   }
 
-  /// 拖动 seek 时的位置预览浮层
-  Widget _buildDragPreview() {
-    final c = _chapter.clamp(0, widget.book.chapters.length - 1);
-    final ch = widget.book.chapters[c];
-    final sentenceNo = _ttsSentence >= 0 ? _ttsSentence + 1 : 1;
-    final pct = (_percent * 100).toStringAsFixed(1);
-    return Positioned(
-      top: MediaQuery.of(context).size.height * 0.15,
-      left: 40,
-      right: 40,
-      child: IgnorePointer(
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
-          decoration: BoxDecoration(
-            color: const Color(0xEE2B1D10),
-            borderRadius: BorderRadius.circular(12),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                ch.title,
-                style: const TextStyle(
-                    color: Color(0xFFE8D5B7),
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              const SizedBox(height: 6),
-              Text(
-                T('sentencePct', {'n': sentenceNo, 'pct': pct}),
-                style:
-                    const TextStyle(color: Color(0xFFC9A96E), fontSize: 14),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   // ---------- 朗读模式底部控制面板 ----------
 
   Widget _buildReadingPanel() {
@@ -1882,7 +1810,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // 音量调节行（音量键被 TTS 上下句占用，暂停时用滑条调节）
+              // 音量调节行（保留暂停面板的音量滑条）
               Row(
                 children: [
                   const Icon(Icons.volume_down, color: Color(0xFFC9A96E), size: 20),
@@ -2515,11 +2443,14 @@ class _ReaderScreenState extends State<ReaderScreen> {
   }
 
   Widget _buildTapZones() {
-    // 朗读模式：点击切换播放/暂停，上下滑动快速跳进
+    // 朗读模式点击切换播放/暂停；滑动切句和翻页适用于所有阅读状态。
     final inReading = _inReadingMode;
     return Positioned.fill(
-      child: GestureDetector(
-        behavior: HitTestBehavior.translucent,
+      child: ReaderGestures(
+        onPreviousSentence: _prevSentence,
+        onNextSentence: _nextSentence,
+        onPreviousPage: _pageUp,
+        onNextPage: _pageDown,
         onTapUp: inReading
             ? (_) {
                 if (_ttsLoading) return; // 加载中忽略点击，防误触
@@ -2541,10 +2472,7 @@ class _ReaderScreenState extends State<ReaderScreen> {
                   _applySystemUi();
                 }
               },
-        onVerticalDragStart: inReading ? _onDragSeekStart : null,
-        onVerticalDragUpdate: inReading ? _onDragSeekUpdate : null,
-        onVerticalDragEnd: inReading ? (_) => _onDragSeekEnd() : null,
-        onVerticalDragCancel: inReading ? () => _dragging = false : null,
+        child: const SizedBox.expand(),
       ),
     );
   }

@@ -37,8 +37,9 @@
   - 定时播放（15 / 30 / 60 / 90 分钟）
   - 切换音源（简/繁/英/日/韩 20 个音色，当前界面语言音色置顶）
   - 退出朗读（电源按钮，恢复正常阅读 UI）
-- 上下滑动：字符级快进/快退（每像素 2 字，句子级精度）
-- 音量键：逐句跳转（朗读模式下生效）
+- 上滑：上一句；下滑：下一句（每次滑动切换一句，支持跨章节）
+- 左滑：下一页；右滑：上一页
+- 音量键：正常调节系统媒体音量（包括朗读、暂停和假锁屏时）
 - 耳机播放键：控制播放/暂停（MediaSession）
 
 ### 自选字体
@@ -136,3 +137,9 @@ flutter build apk --release
 - 滑动 seek：字符级定位，句子级精度
 - 耳机播放键联动 + 音量键逐句
 - 智能分章 + 双文本底层 + 进度自动保存
+
+## Fork 在线构建
+
+推送到 master 或 codex/reader-gestures 后，GitHub Actions 自动测试手势并构建 APK。打开本仓库 Actions → Build Android APK → 成功的运行 → Artifacts → DDNovelReader-gestures-apk，下载 ZIP 后解压安装 APK。也可通过 workflow_dispatch 手动构建。
+
+未配置 android/key.properties 时使用调试密钥签署 release APK。签名与原版不同，无法直接覆盖原版安装；请先备份阅读数据。需要长期覆盖升级时应配置自己的固定发布密钥。
